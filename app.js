@@ -48,6 +48,15 @@ class ChromaCraftPro {
         this.hudSwatch = document.getElementById('hud-swatch');
         this.hudName = document.getElementById('hud-name');
         this.hudRecipe = document.getElementById('hud-recipe');
+
+        // Highlight Overlays
+        this.originalHighlight = document.getElementById('original-highlight');
+        this.colorHighlight = document.getElementById('color-highlight');
+
+        // Toolbar Buttons
+        this.undoBtn = document.getElementById('undo-btn');
+        this.redoBtn = document.getElementById('redo-btn');
+        this.exportSvgBtn = document.getElementById('export-svg-btn');
     }
 
     initConstants() {
@@ -90,6 +99,12 @@ class ChromaCraftPro {
         this.pixelToColorIdx = null;
         this.ignoredHexes = new Set(); // Keep for backward compatibility/UI logic
         this.isSyncingScroll = false;
+        
+        // Undo/Redo Stacks
+        this.history = [];
+        this.redoStack = [];
+        
+        this.highlightedIndex = null;
     }
 
     initEventListeners() {
@@ -113,8 +128,12 @@ class ChromaCraftPro {
         this.originalCanvas.addEventListener('click', (e) => this.handleRefineClick(e));
         this.originalCanvas.addEventListener('mousemove', (e) => this.handleColorPickerMove(e));
         this.originalCanvas.addEventListener('mouseleave', () => this.pickerHud.classList.add('hidden'));
-        
+
         this.colorCanvas.addEventListener('click', (e) => this.handleColorDropClick(e));
+
+        this.undoBtn.addEventListener('click', () => this.undo());
+        this.redoBtn.addEventListener('click', () => this.redo());
+        this.exportSvgBtn.addEventListener('click', () => this.exportAsSVG());
     }
 
     updateZoom(newZoom) {
@@ -124,11 +143,13 @@ class ChromaCraftPro {
         this.wrappers.forEach(w => {
             const canvas = w.querySelector('canvas');
             if (canvas) {
-                // Set the wrapper's physical dimensions to match the scaled canvas
-                // This ensures the container's overflow logic sees the 'correct' size
                 w.style.width = `${canvas.width * this.zoom}px`;
                 w.style.height = `${canvas.height * this.zoom}px`;
-                w.style.transform = `scale(${this.zoom})`;
+                // Apply scale to ALL canvases in the wrapper
+                w.querySelectorAll('canvas').forEach(c => {
+                    c.style.transformOrigin = '0 0';
+                    c.style.transform = `scale(${this.zoom})`;
+                });
             }
         });
     }
@@ -262,6 +283,8 @@ class ChromaCraftPro {
         let { width, height } = this.calculateDimensions(img);
         this.originalCanvas.width = this.colorCanvas.width = this.outlineCanvas.width = width;
         this.originalCanvas.height = this.colorCanvas.height = this.outlineCanvas.height = height;
+        this.originalHighlight.width = this.colorHighlight.width = width;
+        this.originalHighlight.height = this.colorHighlight.height = height;
 
         const ctxOrig = this.originalCanvas.getContext('2d', { willReadFrequently: true });
         ctxOrig.drawImage(img, 0, 0, width, height);
@@ -316,6 +339,12 @@ class ChromaCraftPro {
         this.showLoader(false);
         this.splitView.classList.remove('hidden');
         this.postProcessActions.classList.remove('hidden');
+
+        // Update Undo/Redo button states
+        this.undoBtn.disabled = this.history.length === 0;
+        this.redoBtn.disabled = this.redoStack.length === 0;
+
+        if (this.highlightedIndex !== null) this.updateHighlight();
     }
 
     calculateDimensions(img) {
@@ -379,6 +408,7 @@ class ChromaCraftPro {
         const imgD = ctx.getImageData(0, 0, width, height);
         const pixs = imgD.data;
 
+        // Trace edges
         for (let y = 0; y < height; y++) {
             for (let x = 0; x < width; x++) {
                 const i = y * width + x;
@@ -391,12 +421,60 @@ class ChromaCraftPro {
         }
         ctx.putImageData(imgD, 0, 0);
         
-        ctx.font = 'bold 9px monospace'; ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.textAlign = 'center';
-        const step = Math.max(20, Math.floor(width / 30));
-        for (let y = step/2; y < height; y += step) {
-            for (let x = step/2; x < width; x += step) {
-                const idx = this.pixelToColorIdx[Math.floor(y)*width + Math.floor(x)];
-                ctx.fillText(idx + 1, x, y);
+        // Advanced Label Placement (Centroids)
+        this.placeLabels(ctx, width, height);
+    }
+
+    placeLabels(ctx, width, height) {
+        const data = this.pixelToColorIdx;
+        const visited = new Uint8ClampedArray(width * height);
+        ctx.font = 'bold 9px monospace';
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        for (let i = 0; i < data.length; i++) {
+            if (visited[i]) continue;
+            
+            const colorIdx = data[i];
+            const region = [];
+            const queue = [i];
+            visited[i] = 1;
+            
+            let sumX = 0, sumY = 0;
+            
+            while (queue.length > 0) {
+                const curr = queue.shift();
+                region.push(curr);
+                const x = curr % width;
+                const y = (curr / width) | 0;
+                sumX += x; sumY += y;
+                
+                const adj = [curr-1, curr+1, curr-width, curr+width];
+                for (const next of adj) {
+                    if (next >= 0 && next < data.length && !visited[next] && data[next] === colorIdx) {
+                        const nx = next % width;
+                        if (Math.abs(nx - x) <= 1) { // Same region
+                            visited[next] = 1;
+                            queue.push(next);
+                        }
+                    }
+                }
+            }
+            
+            if (region.length > 50) { // Only label visible areas
+                const cx = sumX / region.length;
+                const cy = sumY / region.length;
+                
+                // Verify centroid is inside region for complex shapes
+                let target = (Math.round(cy) * width + Math.round(cx));
+                if (data[target] === colorIdx) {
+                    ctx.fillText(colorIdx + 1, cx, cy);
+                } else {
+                    // Fallback to a random point in the region if centroid is outside
+                    const p = region[Math.floor(region.length / 2)];
+                    ctx.fillText(colorIdx + 1, p % width, (p / width) | 0);
+                }
             }
         }
     }
@@ -406,10 +484,13 @@ class ChromaCraftPro {
         this.recipeCountBadge.textContent = `${this.projectRecipes.length} Colors`;
         this.projectRecipes.forEach((r, idx) => {
             const item = document.createElement('div');
-            item.className = 'recipe-item';
-            item.title = "Click to remove color from project";
-            item.onclick = (e) => {
-                e.stopPropagation();
+            item.className = 'recipe-item' + (this.highlightedIndex === idx ? ' highlighted' : '');
+            item.title = "Click to highlight, Right click to remove";
+            
+            item.onclick = () => this.toggleHighlight(idx);
+            item.oncontextmenu = (e) => {
+                e.preventDefault();
+                this.pushHistory();
                 this.targetColors.splice(idx, 1);
                 this.reprocess();
             };
@@ -546,9 +627,116 @@ class ChromaCraftPro {
         const ctx = this.originalCanvas.getContext('2d');
         const rgb = this.getSmartSample(ctx, x, y);
         
-        // Simply add to our collection of mandatory target colors
+        this.pushHistory();
         this.targetColors.push(rgb);
         this.reprocess();
+    }
+
+    pushHistory() {
+        this.history.push(JSON.stringify(this.targetColors));
+        this.redoStack = [];
+        if (this.history.length > 50) this.history.shift();
+    }
+
+    undo() {
+        if (!this.history.length) return;
+        this.redoStack.push(JSON.stringify(this.targetColors));
+        this.targetColors = JSON.parse(this.history.pop());
+        this.reprocess();
+    }
+
+    redo() {
+        if (!this.redoStack.length) return;
+        this.history.push(JSON.stringify(this.targetColors));
+        this.targetColors = JSON.parse(this.redoStack.pop());
+        this.reprocess();
+    }
+
+    toggleHighlight(idx) {
+        if (this.highlightedIndex === idx) {
+            this.highlightedIndex = null;
+        } else {
+            this.highlightedIndex = idx;
+        }
+        this.updateRecipeDisplay();
+        this.updateHighlight();
+    }
+
+    updateHighlight() {
+        const w = this.colorCanvas.width, h = this.colorCanvas.height;
+        const ctxO = this.originalHighlight.getContext('2d');
+        const ctxC = this.colorHighlight.getContext('2d');
+        
+        ctxO.clearRect(0,0,w,h);
+        ctxC.clearRect(0,0,w,h);
+
+        if (this.highlightedIndex === null) {
+            this.originalHighlight.classList.remove('active');
+            this.colorHighlight.classList.remove('active');
+            return;
+        }
+
+        this.originalHighlight.classList.add('active');
+        this.colorHighlight.classList.add('active');
+
+        const highlightColor = this.projectRecipes[this.highlightedIndex].hex;
+        
+        // Final pixel data for highlights
+        const imgDO = ctxO.createImageData(w, h);
+        const imgDC = ctxC.createImageData(w, h);
+        const dataO = imgDO.data;
+        const dataC = imgDC.data;
+
+        for (let i = 0; i < this.pixelToColorIdx.length; i++) {
+            if (this.pixelToColorIdx[i] === this.highlightedIndex) {
+                const pi = i * 4;
+                dataO[pi] = dataC[pi] = 255;
+                dataO[pi+1] = dataC[pi+1] = 255;
+                dataO[pi+2] = dataC[pi+2] = 255;
+                dataO[pi+3] = dataC[pi+3] = 255;
+            }
+        }
+        ctxO.putImageData(imgDO, 0, 0);
+        ctxC.putImageData(imgDC, 0, 0);
+    }
+
+    exportAsSVG() {
+        const w = this.colorCanvas.width, h = this.colorCanvas.height;
+        let svg = `<svg viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg">`;
+        
+        this.projectRecipes.forEach((recipe, idx) => {
+            const pathData = this.traceRegion(idx, w, h);
+            if (pathData) {
+                svg += `<path d="${pathData}" fill="${recipe.hex}" stroke="none" />`;
+            }
+        });
+
+        svg += `</svg>`;
+        const blob = new Blob([svg], { type: 'image/svg+xml' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `chromacraft_design.svg`;
+        a.click();
+    }
+
+    traceRegion(idx, w, h) {
+        // Simplified SVG tracing logic: scanline segments
+        // In a real-world app, we'd use Marching Squares or Potrace
+        let paths = "";
+        for (let y = 0; y < h; y++) {
+            let start = -1;
+            for (let x = 0; x < w; x++) {
+                const active = this.pixelToColorIdx[y * w + x] === idx;
+                if (active && start === -1) start = x;
+                else if (!active && start !== -1) {
+                    paths += `M${start},${y}H${x}V${y+1}H${start}Z `;
+                    start = -1;
+                }
+            }
+            if (start !== -1) paths += `M${start},${y}H${w}V${y+1}H${start}Z `;
+        }
+        return paths;
     }
 
     /**
